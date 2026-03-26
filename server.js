@@ -1,105 +1,84 @@
 const express = require("express");
 const cors = require("cors");
+const { MongoClient } = require("mongodb");
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
-// ========================
-// STORAGE (in-memory)
-// ========================
-let servers = {};
-let heatmap = {};
-let loadTimes = {};
-let serverHistory = {};
+// 🔗 MongoDB setup
+const client = new MongoClient(process.env.MONGO_URI);
 
-// ========================
-// CONFIG
-// ========================
-const GRID_SIZE = 20;
-const MAX_HISTORY = 50;
+let db;
 
-// ========================
-// UTILS
-// ========================
-function getCell(pos) {
-	if (!pos) return null;
-	const x = Math.floor(pos.x / GRID_SIZE);
-	const z = Math.floor(pos.z / GRID_SIZE);
-	return `${x},${z}`;
+async function connectDB() {
+	try {
+		await client.connect();
+		db = client.db("loadview");
+		console.log("✅ MongoDB Connected");
+	} catch (err) {
+		console.error("❌ MongoDB Error:", err);
+	}
 }
 
-// ========================
-// MAIN ENDPOINT (ROBLOX POSTS HERE)
-// ========================
-app.post("/server", (req, res) => {
-	const s = req.body;
+connectDB();
 
-	if (!s || !s.jobId) {
-		return res.status(400).send("Invalid data");
-	}
-
-	// STORE SERVER
-	servers[s.jobId] = {
-		...s,
-		lastUpdate: Date.now()
-	};
-
-	// ========================
-	// SERVER HISTORY (GRAPH)
-	// ========================
-	if (!serverHistory[s.jobId]) serverHistory[s.jobId] = [];
-
-	serverHistory[s.jobId].push({
-		time: Date.now(),
-		fps: s.serverFPS,
-		ping: s.avgPing
-	});
-
-	if (serverHistory[s.jobId].length > MAX_HISTORY) {
-		serverHistory[s.jobId].shift();
-	}
-
-	// ========================
-	// PROCESS PLAYERS
-	// ========================
-	for (let id in s.players) {
-		let p = s.players[id];
-
-		// LOAD TIMES
-		if (p.LoadTime) {
-			loadTimes[id] = p.LoadTime;
-		}
-
-		// HEATMAP
-		if (p.Position) {
-			let cell = getCell(p.Position);
-			if (!cell) continue;
-
-			if (!heatmap[cell]) {
-				heatmap[cell] = {
-					count: 0,
-					totalFPS: 0
-				};
-			}
-
-			heatmap[cell].count++;
-			heatmap[cell].totalFPS += p.AvgFPS || 0;
-		}
-	}
-
-	res.sendStatus(200);
+// 🧪 TEST ROUTE
+app.get("/", (req, res) => {
+	res.send("API running");
 });
 
-// ========================
-// GET SERVERS
-// ========================
-app.get("/servers", (req, res) => {
-	res.json(servers);
+// 🧪 TEST DB SAVE
+app.get("/testdb", async (req, res) => {
+	try {
+		await db.collection("test").insertOne({
+			msg: "hello from render",
+			time: new Date()
+		});
+		res.send("Saved to MongoDB");
+	} catch (err) {
+		res.status(500).send("Error saving");
+	}
 });
 
-// ========================
-// GET HEATMAP
+// 🎮 ROBLOX DATA ENDPOINT
+app.post("/data", async (req, res) => {
+	try {
+		const data = req.body;
+
+		await db.collection("metrics").insertOne({
+			...data,
+			time: new Date()
+		});
+
+		res.send("ok");
+	} catch (err) {
+		console.error(err);
+		res.status(500).send("error");
+	}
+});
+
+// 🚪 SESSION SAVE (on player leave)
+app.post("/session", async (req, res) => {
+	try {
+		const data = req.body;
+
+		await db.collection("sessions").insertOne({
+			...data,
+			time: new Date()
+		});
+
+		res.send("saved");
+	} catch (err) {
+		res.status(500).send("error");
+	}
+});
+
+// 🌐 PORT
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+	console.log("🚀 Server running on port " + PORT);
+});// GET HEATMAP
 // ========================
 app.get("/heatmap", (req, res) => {
 	let out = {};
