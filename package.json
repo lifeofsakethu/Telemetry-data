@@ -1,9 +1,14 @@
 {
-  "name": "roblox-analytics",
+  "name": "roblox-loadview",
   "version": "1.0.0",
+  "description": "Roblox performance analytics backend",
   "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "cors": "^2.8.5"
+    "mongodb": "^6.7.0"
   }
 }
