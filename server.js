@@ -7,99 +7,187 @@ app.use(cors());
 app.use(express.json());
 
 // ========================
-// MEMORY DATA (TEMP CACHE)
-// ========================
-let heatmap = {};
-let loadTimes = [];
-let serverHistory = {};
-let servers = {};
-
-// ========================
-// MONGODB SETUP
+// 🔗 MONGODB
 // ========================
 const client = new MongoClient(process.env.MONGO_URI);
+
 let db;
 
 async function connectDB() {
 	try {
 		await client.connect();
-		db = client.db("loadview");
+		db = client.db("loadview"); // your DB name
 		console.log("✅ MongoDB Connected");
 	} catch (err) {
 		console.error("❌ MongoDB Error:", err);
 	}
 }
+
 connectDB();
 
 // ========================
-// ROOT
+// 🧪 ROOT
 // ========================
 app.get("/", (req, res) => {
-	res.send("Roblox Analytics API Running");
+	res.send("API running");
 });
 
 // ========================
-// TEST DB SAVE
+// 🧪 TEST DB
 // ========================
 app.get("/testdb", async (req, res) => {
 	try {
 		await db.collection("test").insertOne({
-			msg: "hello from render",
+			msg: "hello",
 			time: new Date()
 		});
 		res.send("Saved to MongoDB");
-	} catch (err) {
-		res.status(500).send("Error saving");
+	} catch {
+		res.status(500).send("DB error");
 	}
 });
 
 // ========================
-// ROBLOX DATA
+// 📡 MAIN DATA
 // ========================
 app.post("/data", async (req, res) => {
 	try {
-		const data = req.body;
-
-		// Save to MongoDB
 		await db.collection("metrics").insertOne({
-			...data,
+			...req.body,
 			time: new Date()
 		});
+		res.send("ok");
+	} catch (err) {
+		console.error(err);
+		res.status(500).send("error");
+	}
+});
 
-		// HEATMAP UPDATE
-		if (data.x && data.z && data.fps) {
-			let key = `${Math.floor(data.x)}_${Math.floor(data.z)}`;
+// ========================
+// 🚪 SESSION (PLAYER LEAVE)
+// ========================
+app.post("/session", async (req, res) => {
+	try {
+		await db.collection("sessions").insertOne({
+			...req.body,
+			time: new Date()
+		});
+		res.send("saved");
+	} catch {
+		res.status(500).send("error");
+	}
+});
 
-			if (!heatmap[key]) {
-				heatmap[key] = { totalFPS: 0, count: 0 };
-			}
+// ========================
+// ⚡ LOAD TIMES
+// ========================
+app.post("/loadtimes", async (req, res) => {
+	try {
+		await db.collection("loadtimes").insertOne({
+			...req.body,
+			time: new Date()
+		});
+		res.send("ok");
+	} catch {
+		res.status(500).send("error");
+	}
+});
 
-			heatmap[key].totalFPS += data.fps;
-			heatmap[key].count++;
+// ========================
+// 🖥️ SERVER HISTORY
+// ========================
+app.post("/server-history", async (req, res) => {
+	try {
+		await db.collection("serverHistory").insertOne({
+			...req.body,
+			time: new Date()
+		});
+		res.send("ok");
+	} catch {
+		res.status(500).send("error");
+	}
+});
+
+// ========================
+// 📊 GET METRICS
+// ========================
+app.get("/metrics", async (req, res) => {
+	const data = await db.collection("metrics")
+		.find()
+		.sort({ time: -1 })
+		.limit(100)
+		.toArray();
+
+	res.json(data);
+});
+
+// ========================
+// 🔥 HEATMAP
+// ========================
+app.get("/heatmap", async (req, res) => {
+	const data = await db.collection("metrics")
+		.find({ x: { $exists: true } })
+		.toArray();
+
+	let heatmap = {};
+
+	data.forEach(d => {
+		const key = `${d.x},${d.z}`;
+
+		if (!heatmap[key]) {
+			heatmap[key] = { count: 0, totalFPS: 0 };
 		}
 
-		// LOAD TIME TRACK
-		if (data.loadTime) {
-			loadTimes.push(data.loadTime);
-		}
+		heatmap[key].count++;
+		heatmap[key].totalFPS += d.fps || 0;
+	});
 
-		// SERVER TRACKING
-		if (data.serverId) {
-			if (!servers[data.serverId]) {
-				servers[data.serverId] = {
-					lastUpdate: Date.now(),
-					players: 0
-				};
-			}
+	let out = {};
 
-			servers[data.serverId].lastUpdate = Date.now();
-			servers[data.serverId].players = data.players || 0;
+	for (let k in heatmap) {
+		out[k] = {
+			count: heatmap[k].count,
+			avgFPS: Math.floor(heatmap[k].totalFPS / heatmap[k].count)
+		};
+	}
 
-			if (!serverHistory[data.serverId]) {
-				serverHistory[data.serverId] = [];
-			}
+	res.json(out);
+});
 
-			serverHistory[data.serverId].push({
+// ========================
+// ⚡ GET LOAD TIMES
+// ========================
+app.get("/loadtimes", async (req, res) => {
+	const data = await db.collection("loadtimes")
+		.find()
+		.sort({ time: -1 })
+		.limit(100)
+		.toArray();
+
+	res.json(data);
+});
+
+// ========================
+// 🖥️ GET SERVER HISTORY
+// ========================
+app.get("/server-history", async (req, res) => {
+	const data = await db.collection("serverHistory")
+		.find()
+		.sort({ time: -1 })
+		.limit(100)
+		.toArray();
+
+	res.json(data);
+});
+
+// ========================
+// 🚀 START SERVER
+// ========================
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+	console.log("🚀 Server running on port " + PORT);
+});			serverHistory[data.serverId].push({
 				time: Date.now(),
 				players: data.players || 0,
 				fps: data.fps || 0
