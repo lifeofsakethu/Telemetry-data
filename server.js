@@ -1,10 +1,21 @@
 const express = require("express");
 const cors = require("cors");
-const { MongoClient, ObjectId } = require("mongodb");
+const { MongoClient } = require("mongodb");
+const rateLimit = require("express-rate-limit");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ========================
+// 🔒 RATE LIMIT
+// ========================
+const limiter = rateLimit({
+	windowMs: 60 * 1000,
+	max: 100
+});
+app.use(limiter);
 
 // ========================
 // 🔗 MONGODB
@@ -27,76 +38,59 @@ connectDB();
 // 🧪 ROOT
 // ========================
 app.get("/", (req, res) => {
-	res.send("API running");
+	res.send("🚀 Rolag API running");
 });
 
 // ========================
-// 👤 USER REGISTER
+// 🔐 REGISTER GAME
 // ========================
 app.post("/register", async (req, res) => {
-	const { username, password } = req.body;
-
-	const exists = await db.collection("users").findOne({ username });
-	if (exists) return res.status(400).send("User exists");
-
-	await db.collection("users").insertOne({
-		username,
-		password, // (later hash this)
-		created: new Date()
-	});
-
-	res.send("registered");
-});
-
-// ========================
-// 🔐 LOGIN
-// ========================
-app.post("/login", async (req, res) => {
-	const { username, password } = req.body;
-
-	const user = await db.collection("users").findOne({ username, password });
-	if (!user) return res.status(401).send("invalid");
-
-	res.json({ userId: user._id });
-});
-
-// ========================
-// 🎮 REGISTER GAME
-// ========================
-app.post("/register-game", async (req, res) => {
-	const { userId, gameName } = req.body;
-
-	const apiKey = Math.random().toString(36).substring(2);
-
-	await db.collection("games").insertOne({
-		userId: new ObjectId(userId),
-		gameName,
-		apiKey,
-		created: new Date()
-	});
-
-	res.json({ apiKey });
-});
-
-// ========================
-// 📡 DATA (WITH API KEY)
-// ========================
-app.post("/data", async (req, res) => {
 	try {
-		const { apiKey } = req.body;
+		const { name } = req.body;
 
-		const game = await db.collection("games").findOne({ apiKey });
-		if (!game) return res.status(403).send("invalid key");
-
-		await db.collection("metrics").insertOne({
-			...req.body,
-			gameId: game._id,
-			time: new Date()
+		const game = await db.collection("games").insertOne({
+			name,
+			created: new Date()
 		});
 
-		res.send("ok");
+		const token = jwt.sign(
+			{ gameId: game.insertedId },
+			process.env.JWT_SECRET
+		);
+
+		res.json({ token, gameId: game.insertedId });
 	} catch (err) {
-		console.error(err);
+		res.status(500).send("error");
+	}
+});
+
+// ========================
+// 🔐 AUTH MIDDLEWARE
+// ========================
+function auth(req, res, next) {
+	const token = req.headers["authorization"];
+	if (!token) return res.status(401).send("No token");
+
+	try {
+		req.user = jwt.verify(token, process.env.JWT_SECRET);
+		next();
+	} catch {
+		res.status(403).send("Invalid token");
+	}
+}
+
+// ========================
+// 📡 DATA
+// ========================
+app.post("/data", auth, async (req, res) => {
+	try {
+		await db.collection("metrics").insertOne({
+			gameId: req.user.gameId,
+			...req.body,
+			time: new Date()
+		});
+		res.send("ok");
+	} catch {
 		res.status(500).send("error");
 	}
 });
@@ -104,13 +98,14 @@ app.post("/data", async (req, res) => {
 // ========================
 // 🚪 SESSION
 // ========================
-app.post("/session", async (req, res) => {
+app.post("/session", auth, async (req, res) => {
 	try {
 		await db.collection("sessions").insertOne({
+			gameId: req.user.gameId,
 			...req.body,
 			time: new Date()
 		});
-		res.send("ok");
+		res.send("saved");
 	} catch {
 		res.status(500).send("error");
 	}
@@ -119,9 +114,10 @@ app.post("/session", async (req, res) => {
 // ========================
 // ⚡ LOAD TIMES
 // ========================
-app.post("/loadtimes", async (req, res) => {
+app.post("/loadtimes", auth, async (req, res) => {
 	try {
 		await db.collection("loadtimes").insertOne({
+			gameId: req.user.gameId,
 			...req.body,
 			time: new Date()
 		});
@@ -132,29 +128,11 @@ app.post("/loadtimes", async (req, res) => {
 });
 
 // ========================
-// 🖥️ SERVER HISTORY
+// 📊 GET METRICS
 // ========================
-app.post("/server-history", async (req, res) => {
-	try {
-		await db.collection("serverHistory").insertOne({
-			...req.body,
-			time: new Date()
-		});
-		res.send("ok");
-	} catch {
-		res.status(500).send("error");
-	}
-});
-
-// ========================
-// 📊 GET METRICS (PER GAME)
-// ========================
-app.get("/metrics/:apiKey", async (req, res) => {
-	const game = await db.collection("games").findOne({ apiKey: req.params.apiKey });
-	if (!game) return res.status(404).send("no game");
-
+app.get("/metrics/:gameId", async (req, res) => {
 	const data = await db.collection("metrics")
-		.find({ gameId: game._id })
+		.find({ gameId: req.params.gameId })
 		.sort({ time: -1 })
 		.limit(100)
 		.toArray();
@@ -165,19 +143,20 @@ app.get("/metrics/:apiKey", async (req, res) => {
 // ========================
 // 🔥 HEATMAP
 // ========================
-app.get("/heatmap/:apiKey", async (req, res) => {
-	const game = await db.collection("games").findOne({ apiKey: req.params.apiKey });
-	if (!game) return res.status(404).send("no game");
-
+app.get("/heatmap/:gameId", async (req, res) => {
 	const data = await db.collection("metrics")
-		.find({ gameId: game._id, x: { $exists: true } })
+		.find({ gameId: req.params.gameId })
 		.toArray();
 
 	let heatmap = {};
 
 	data.forEach(d => {
+		if (!d.x) return;
+
 		const key = `${d.x},${d.z}`;
-		if (!heatmap[key]) heatmap[key] = { count: 0, totalFPS: 0 };
+		if (!heatmap[key]) {
+			heatmap[key] = { count: 0, totalFPS: 0 };
+		}
 
 		heatmap[key].count++;
 		heatmap[key].totalFPS += d.fps || 0;
@@ -195,10 +174,9 @@ app.get("/heatmap/:apiKey", async (req, res) => {
 });
 
 // ========================
-// 🚀 START SERVER
+// 🚀 START
 // ========================
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
 	console.log("🚀 Server running on port " + PORT);
 });
