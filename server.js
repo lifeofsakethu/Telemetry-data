@@ -49,7 +49,6 @@ let servers = {};
 // ========================
 function auth(req, res, next) {
   const token = req.headers.authorization;
-
   if (!token) return res.status(401).send("No token");
 
   try {
@@ -62,7 +61,7 @@ function auth(req, res, next) {
 }
 
 // ========================
-// 👤 REGISTER USER
+// 👤 REGISTER
 // ========================
 app.post("/register", async (req, res) => {
   try {
@@ -111,7 +110,7 @@ app.post("/login", async (req, res) => {
 });
 
 // ========================
-// 🎮 REGISTER GAME (AUTH)
+// 🎮 REGISTER GAME
 // ========================
 app.post("/register-game", auth, async (req, res) => {
   try {
@@ -151,7 +150,7 @@ app.post("/data", async (req, res) => {
       };
     }
 
-    // ALERT
+    // alert if low fps
     if (data.fps && data.fps < 30) {
       await db.collection("alerts").insertOne({
         gameId: data.gameId,
@@ -161,7 +160,25 @@ app.post("/data", async (req, res) => {
     }
 
     res.send("ok");
-  } catch {
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("error");
+  }
+});
+
+// ========================
+// 🧠 SESSION SAVE (FIXED)
+// ========================
+app.post("/session", async (req, res) => {
+  try {
+    await db.collection("sessions").insertOne({
+      ...req.body,
+      time: new Date()
+    });
+
+    res.send("saved");
+  } catch (err) {
+    console.error(err);
     res.status(500).send("error");
   }
 });
@@ -242,21 +259,15 @@ app.get("/root/:id", async (req, res) => {
     const curr = data[i];
 
     if (curr.players > prev.players + 3 && curr.fps < prev.fps - 10) {
-      insights.push({
-        msg: "FPS dropped after player spike",
-        cause: "Server overload"
-      });
+      insights.push("FPS dropped after player spike → overload");
     }
 
     if (Math.abs(curr.players - prev.players) < 1 && curr.fps < prev.fps - 15) {
-      insights.push({
-        msg: "FPS dropped without player increase",
-        cause: "Script or memory issue"
-      });
+      insights.push("FPS dropped without players → script issue");
     }
   }
 
-  res.json({ insights });
+  res.json(insights);
 });
 
 // ========================
@@ -297,84 +308,4 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log("🚀 Server running on port " + PORT);
-});	try {
-		await db.collection("sessions").insertOne({
-			gameId: req.user.gameId,
-			...req.body,
-			time: new Date()
-		});
-		res.send("saved");
-	} catch {
-		res.status(500).send("error");
-	}
-});
-
-// ========================
-// ⚡ LOAD TIMES
-// ========================
-app.post("/loadtimes", auth, async (req, res) => {
-	try {
-		await db.collection("loadtimes").insertOne({
-			gameId: req.user.gameId,
-			...req.body,
-			time: new Date()
-		});
-		res.send("ok");
-	} catch {
-		res.status(500).send("error");
-	}
-});
-
-// ========================
-// 📊 GET METRICS
-// ========================
-app.get("/metrics/:gameId", async (req, res) => {
-	const data = await db.collection("metrics")
-		.find({ gameId: req.params.gameId })
-		.sort({ time: -1 })
-		.limit(100)
-		.toArray();
-
-	res.json(data);
-});
-
-// ========================
-// 🔥 HEATMAP
-// ========================
-app.get("/heatmap/:gameId", async (req, res) => {
-	const data = await db.collection("metrics")
-		.find({ gameId: req.params.gameId })
-		.toArray();
-
-	let heatmap = {};
-
-	data.forEach(d => {
-		if (!d.x) return;
-
-		const key = `${d.x},${d.z}`;
-		if (!heatmap[key]) {
-			heatmap[key] = { count: 0, totalFPS: 0 };
-		}
-
-		heatmap[key].count++;
-		heatmap[key].totalFPS += d.fps || 0;
-	});
-
-	let out = {};
-	for (let k in heatmap) {
-		out[k] = {
-			count: heatmap[k].count,
-			avgFPS: Math.floor(heatmap[k].totalFPS / heatmap[k].count)
-		};
-	}
-
-	res.json(out);
-});
-
-// ========================
-// 🚀 START
-// ========================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-	console.log("🚀 Server running on port " + PORT);
 });
