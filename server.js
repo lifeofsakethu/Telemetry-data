@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
 const rateLimit = require("express-rate-limit");
+const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -11,11 +12,15 @@ app.use(express.json());
 // ========================
 // 🔒 RATE LIMIT
 // ========================
-const limiter = rateLimit({
-	windowMs: 60 * 1000,
-	max: 100
-});
-app.use(limiter);
+app.use(rateLimit({
+  windowMs: 10 * 1000,
+  max: 100
+}));
+
+// ========================
+// 🔐 CONFIG
+// ========================
+const SECRET = process.env.JWT_SECRET || "supersecret";
 
 // ========================
 // 🔗 MONGODB
@@ -24,82 +29,275 @@ const client = new MongoClient(process.env.MONGO_URI);
 let db;
 
 async function connectDB() {
-	try {
-		await client.connect();
-		db = client.db("loadview");
-		console.log("✅ MongoDB Connected");
-	} catch (err) {
-		console.error("❌ MongoDB Error:", err);
-	}
+  try {
+    await client.connect();
+    db = client.db("rolag");
+    console.log("✅ MongoDB Connected");
+  } catch (err) {
+    console.error(err);
+  }
 }
 connectDB();
+
+// ========================
+// 🧠 MEMORY (LIVE SERVERS)
+// ========================
+let servers = {};
+
+// ========================
+// 🔒 AUTH MIDDLEWARE
+// ========================
+function auth(req, res, next) {
+  const token = req.headers.authorization;
+
+  if (!token) return res.status(401).send("No token");
+
+  try {
+    const decoded = jwt.verify(token, SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).send("Invalid token");
+  }
+}
+
+// ========================
+// 👤 REGISTER USER
+// ========================
+app.post("/register", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const exists = await db.collection("users").findOne({ email });
+    if (exists) return res.status(400).send("User exists");
+
+    const hash = await bcrypt.hash(password, 10);
+
+    await db.collection("users").insertOne({
+      email,
+      password: hash,
+      createdAt: new Date()
+    });
+
+    res.send("registered");
+  } catch {
+    res.status(500).send("error");
+  }
+});
+
+// ========================
+// 🔑 LOGIN
+// ========================
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const user = await db.collection("users").findOne({ email });
+    if (!user) return res.status(400).send("User not found");
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(400).send("Wrong password");
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email },
+      SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({ token });
+  } catch {
+    res.status(500).send("error");
+  }
+});
+
+// ========================
+// 🎮 REGISTER GAME (AUTH)
+// ========================
+app.post("/register-game", auth, async (req, res) => {
+  try {
+    const { gameId, name } = req.body;
+
+    await db.collection("games").updateOne(
+      { gameId },
+      {
+        $set: {
+          name: name || "Unnamed",
+          owner: req.user.id,
+          updatedAt: new Date()
+        }
+      },
+      { upsert: true }
+    );
+
+    res.send("registered");
+  } catch {
+    res.status(500).send("error");
+  }
+});
+
+// ========================
+// 📡 DATA INGEST
+// ========================
+app.post("/data", async (req, res) => {
+  try {
+    const data = { ...req.body, time: new Date() };
+
+    await db.collection("metrics").insertOne(data);
+
+    if (data.serverId) {
+      servers[data.serverId] = {
+        ...data,
+        lastUpdate: Date.now()
+      };
+    }
+
+    // ALERT
+    if (data.fps && data.fps < 30) {
+      await db.collection("alerts").insertOne({
+        gameId: data.gameId,
+        message: `[${data.serverId}] Low FPS: ${data.fps}`,
+        time: new Date()
+      });
+    }
+
+    res.send("ok");
+  } catch {
+    res.status(500).send("error");
+  }
+});
+
+// ========================
+// 🖥️ LIVE SERVERS
+// ========================
+app.get("/live/:gameId", (req, res) => {
+  const out = [];
+
+  for (let id in servers) {
+    const s = servers[id];
+
+    if (s.gameId === req.params.gameId) {
+      out.push({
+        serverId: id,
+        players: s.players || 0,
+        fps: s.fps || 0
+      });
+    }
+  }
+
+  res.json(out);
+});
+
+// ========================
+// 🚨 ALERTS
+// ========================
+app.get("/alerts/:gameId", async (req, res) => {
+  const alerts = await db.collection("alerts")
+    .find({ gameId: req.params.gameId })
+    .sort({ time: -1 })
+    .limit(50)
+    .toArray();
+
+  res.json(alerts);
+});
+
+// ========================
+// 📊 METRICS
+// ========================
+app.get("/metrics/:gameId", async (req, res) => {
+  const data = await db.collection("metrics")
+    .find({ gameId: req.params.gameId })
+    .sort({ time: -1 })
+    .limit(100)
+    .toArray();
+
+  res.json(data);
+});
+
+// ========================
+// 🔍 SERVER DETAILS
+// ========================
+app.get("/server/:id", async (req, res) => {
+  const data = await db.collection("metrics")
+    .find({ serverId: req.params.id })
+    .sort({ time: -1 })
+    .limit(100)
+    .toArray();
+
+  res.json(data);
+});
+
+// ========================
+// 🧠 ROOT CAUSE
+// ========================
+app.get("/root/:id", async (req, res) => {
+  const data = await db.collection("metrics")
+    .find({ serverId: req.params.id })
+    .sort({ time: 1 })
+    .toArray();
+
+  let insights = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const prev = data[i - 1];
+    const curr = data[i];
+
+    if (curr.players > prev.players + 3 && curr.fps < prev.fps - 10) {
+      insights.push({
+        msg: "FPS dropped after player spike",
+        cause: "Server overload"
+      });
+    }
+
+    if (Math.abs(curr.players - prev.players) < 1 && curr.fps < prev.fps - 15) {
+      insights.push({
+        msg: "FPS dropped without player increase",
+        cause: "Script or memory issue"
+      });
+    }
+  }
+
+  res.json({ insights });
+});
+
+// ========================
+// 👤 USER GAMES
+// ========================
+app.get("/my-games", auth, async (req, res) => {
+  const games = await db.collection("games")
+    .find({ owner: req.user.id })
+    .toArray();
+
+  res.json(games);
+});
+
+// ========================
+// 🧹 CLEANUP
+// ========================
+setInterval(() => {
+  const now = Date.now();
+
+  for (let id in servers) {
+    if (now - servers[id].lastUpdate > 30000) {
+      delete servers[id];
+    }
+  }
+}, 10000);
 
 // ========================
 // 🧪 ROOT
 // ========================
 app.get("/", (req, res) => {
-	res.send("🚀 Rolag API running");
+  res.send("API running 🚀");
 });
 
 // ========================
-// 🔐 REGISTER GAME
+// 🚀 START
 // ========================
-app.post("/register", async (req, res) => {
-	try {
-		const { name } = req.body;
+const PORT = process.env.PORT || 3000;
 
-		const game = await db.collection("games").insertOne({
-			name,
-			created: new Date()
-		});
-
-		const token = jwt.sign(
-			{ gameId: game.insertedId },
-			process.env.JWT_SECRET
-		);
-
-		res.json({ token, gameId: game.insertedId });
-	} catch (err) {
-		res.status(500).send("error");
-	}
-});
-
-// ========================
-// 🔐 AUTH MIDDLEWARE
-// ========================
-function auth(req, res, next) {
-	const token = req.headers["authorization"];
-	if (!token) return res.status(401).send("No token");
-
-	try {
-		req.user = jwt.verify(token, process.env.JWT_SECRET);
-		next();
-	} catch {
-		res.status(403).send("Invalid token");
-	}
-}
-
-// ========================
-// 📡 DATA
-// ========================
-app.post("/data", auth, async (req, res) => {
-	try {
-		await db.collection("metrics").insertOne({
-			gameId: req.user.gameId,
-			...req.body,
-			time: new Date()
-		});
-		res.send("ok");
-	} catch {
-		res.status(500).send("error");
-	}
-});
-
-// ========================
-// 🚪 SESSION
-// ========================
-app.post("/session", auth, async (req, res) => {
-	try {
+app.listen(PORT, () => {
+  console.log("🚀 Server running on port " + PORT);
+});	try {
 		await db.collection("sessions").insertOne({
 			gameId: req.user.gameId,
 			...req.body,
