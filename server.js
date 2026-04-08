@@ -12,48 +12,34 @@ app.use(express.json());
 // ========================
 // 🔒 RATE LIMIT
 // ========================
-app.use(rateLimit({
-  windowMs: 10 * 1000,
-  max: 100
-}));
+app.use(rateLimit({ windowMs: 10000, max: 100 }));
 
-// ========================
-// 🔐 CONFIG
 // ========================
 const SECRET = process.env.JWT_SECRET || "supersecret";
 
 // ========================
-// 🔗 MONGODB
+// DB
 // ========================
 const client = new MongoClient(process.env.MONGO_URI);
 let db;
 
-async function connectDB() {
-  try {
-    await client.connect();
-    db = client.db("rolag");
-    console.log("✅ MongoDB Connected");
-  } catch (err) {
-    console.error(err);
-  }
-}
-connectDB();
+client.connect().then(() => {
+  db = client.db("rolag");
+  console.log("DB connected");
+});
 
-// ========================
-// 🧠 MEMORY (LIVE SERVERS)
 // ========================
 let servers = {};
 
 // ========================
-// 🔒 AUTH MIDDLEWARE
+// AUTH
 // ========================
 function auth(req, res, next) {
   const token = req.headers.authorization;
   if (!token) return res.status(401).send("No token");
 
   try {
-    const decoded = jwt.verify(token, SECRET);
-    req.user = decoded;
+    req.user = jwt.verify(token, SECRET);
     next();
   } catch {
     res.status(401).send("Invalid token");
@@ -61,45 +47,160 @@ function auth(req, res, next) {
 }
 
 // ========================
-// 👤 REGISTER
+// USER
 // ========================
 app.post("/register", async (req, res) => {
-  try {
-    const { email, password } = req.body;
+  const { email, password } = req.body;
 
-    const exists = await db.collection("users").findOne({ email });
-    if (exists) return res.status(400).send("User exists");
+  const hash = await bcrypt.hash(password, 10);
 
-    const hash = await bcrypt.hash(password, 10);
+  await db.collection("users").insertOne({ email, password: hash });
 
-    await db.collection("users").insertOne({
-      email,
-      password: hash,
-      createdAt: new Date()
-    });
+  res.send("ok");
+});
 
-    res.send("registered");
-  } catch {
-    res.status(500).send("error");
-  }
+app.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  const user = await db.collection("users").findOne({ email });
+  if (!user) return res.status(400).send("no user");
+
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return res.status(400).send("wrong");
+
+  const token = jwt.sign({ id: user._id }, SECRET);
+  res.json({ token });
 });
 
 // ========================
-// 🔑 LOGIN
+// GAME
 // ========================
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
+app.post("/register-game", auth, async (req, res) => {
+  const { gameId, name } = req.body;
 
-    const user = await db.collection("users").findOne({ email });
-    if (!user) return res.status(400).send("User not found");
+  await db.collection("games").updateOne(
+    { gameId },
+    { $set: { name, owner: req.user.id } },
+    { upsert: true }
+  );
 
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(400).send("Wrong password");
+  res.send("ok");
+});
 
-    const token = jwt.sign(
-      { id: user._id, email: user.email },
-      SECRET,
+// ========================
+// DATA
+// ========================
+app.post("/data", async (req, res) => {
+  const d = { ...req.body, time: new Date() };
+
+  await db.collection("metrics").insertOne(d);
+
+  servers[d.serverId] = { ...d, last: Date.now() };
+
+  if (d.fps < 30) {
+    await db.collection("alerts").insertOne({
+      gameId: d.gameId,
+      message: "Low FPS",
+      time: new Date()
+    });
+  }
+
+  res.send("ok");
+});
+
+// ========================
+// SESSION
+// ========================
+app.post("/session", async (req, res) => {
+  await db.collection("sessions").insertOne({
+    ...req.body,
+    time: new Date()
+  });
+
+  res.send("ok");
+});
+
+// ========================
+// LIVE
+// ========================
+app.get("/live/:gameId", (req, res) => {
+  const out = Object.values(servers).filter(
+    s => s.gameId === req.params.gameId
+  );
+  res.json(out);
+});
+
+// ========================
+// ALERTS
+// ========================
+app.get("/alerts/:gameId", async (req, res) => {
+  const a = await db.collection("alerts")
+    .find({ gameId: req.params.gameId })
+    .toArray();
+  res.json(a);
+});
+
+// ========================
+// METRICS
+// ========================
+app.get("/metrics/:gameId", async (req, res) => {
+  const m = await db.collection("metrics")
+    .find({ gameId: req.params.gameId })
+    .sort({ time: -1 })
+    .limit(100)
+    .toArray();
+  res.json(m);
+});
+
+// ========================
+// ROOT CAUSE
+// ========================
+app.get("/root/:id", async (req, res) => {
+  const d = await db.collection("metrics")
+    .find({ serverId: req.params.id })
+    .toArray();
+
+  let out = [];
+
+  for (let i = 1; i < d.length; i++) {
+    if (d[i].fps < d[i-1].fps - 10) {
+      out.push("FPS drop detected");
+    }
+  }
+
+  res.json(out);
+});
+
+// ========================
+// HEATMAP
+// ========================
+app.get("/heatmap", async (req, res) => {
+  const data = await db.collection("metrics")
+    .find({ x: { $exists: true } })
+    .toArray();
+
+  let map = {};
+
+  data.forEach(d => {
+    const key = `${d.x},${d.z}`;
+    if (!map[key]) map[key] = { count: 0 };
+    map[key].count++;
+  });
+
+  res.json(map);
+});
+
+// ========================
+setInterval(() => {
+  const now = Date.now();
+  for (let id in servers) {
+    if (now - servers[id].last > 30000) delete servers[id];
+  }
+}, 10000);
+
+app.get("/", (req,res)=>res.send("API running"));
+
+app.listen(process.env.PORT || 3000);      SECRET,
       { expiresIn: "7d" }
     );
 
