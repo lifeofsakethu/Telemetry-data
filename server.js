@@ -19,6 +19,7 @@ app.use(rateLimit({ windowMs: 10000, max: 100 }));
 const SECRET = process.env.JWT_SECRET || "secret";
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// ================= DB =================
 const client = new MongoClient(process.env.MONGO_URI);
 let db;
 
@@ -27,6 +28,7 @@ client.connect().then(() => {
   console.log("✅ DB connected");
 });
 
+// ================= MEMORY =================
 let servers = {};
 let lastAlertSent = {};
 let clients = [];
@@ -34,6 +36,7 @@ let clients = [];
 // ================= WEBSOCKET =================
 wss.on("connection", ws => {
   clients.push(ws);
+
   ws.on("close", () => {
     clients = clients.filter(c => c !== ws);
   });
@@ -67,7 +70,11 @@ app.post("/register", async (req, res) => {
   await db.collection("users").insertOne({
     email,
     password: hash,
-    alertPrefs: { enabled: true, minFps: 30, cooldown: 300 }
+    alertPrefs: {
+      enabled: true,
+      minFps: 30,
+      cooldown: 60
+    }
   });
 
   res.send("ok");
@@ -75,24 +82,36 @@ app.post("/register", async (req, res) => {
 
 // ================= LOGIN =================
 app.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+  try {
+    const { email, password } = req.body;
 
-  const u = await db.collection("users").findOne({ email });
-  if (!u) return res.status(400).send("no user");
+    const user = await db.collection("users").findOne({ email });
+    if (!user) return res.status(400).send("No user");
 
-  const ok = await bcrypt.compare(password, u.password);
-  if (!ok) return res.status(400).send("wrong");
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(400).send("Wrong password");
 
-  const token = jwt.sign({ id: u._id }, SECRET, { expiresIn: "7d" });
-  res.json({ token });
+    const token = jwt.sign(
+      { id: user._id },
+      SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({ token });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("error");
+  }
 });
 
-// ================= PREFS =================
+// ================= ALERT PREFS =================
 app.get("/me/prefs", auth, async (req, res) => {
-  const u = await db.collection("users").findOne({
+  const user = await db.collection("users").findOne({
     _id: new ObjectId(req.user.id)
   });
-  res.json(u.alertPrefs);
+
+  res.json(user.alertPrefs);
 });
 
 app.post("/me/prefs", auth, async (req, res) => {
@@ -100,6 +119,174 @@ app.post("/me/prefs", auth, async (req, res) => {
     { _id: new ObjectId(req.user.id) },
     { $set: { alertPrefs: req.body } }
   );
+
+  res.send("saved");
+});
+
+// ================= GAME =================
+app.post("/register-game", auth, async (req, res) => {
+  const { gameId, name } = req.body;
+
+  await db.collection("games").updateOne(
+    { gameId },
+    {
+      $set: {
+        name: name || "Unnamed",
+        owner: req.user.id
+      }
+    },
+    { upsert: true }
+  );
+
+  res.send("ok");
+});
+
+// ================= EMAIL =================
+async function sendEmail(to, message) {
+  try {
+    await resend.emails.send({
+      from: "onboarding@resend.dev",
+      to,
+      subject: "🚨 FPS Alert",
+      html: `<p>${message}</p>`
+    });
+  } catch (err) {
+    console.error("Email failed", err);
+  }
+}
+
+// ================= DATA =================
+app.post("/data", async (req, res) => {
+  try {
+    const data = { ...req.body, time: new Date() };
+
+    await db.collection("metrics").insertOne(data);
+
+    if (data.serverId) {
+      servers[data.serverId] = {
+        ...data,
+        lastUpdate: Date.now()
+      };
+    }
+
+    broadcast("metrics", data);
+
+    // find game owner
+    const game = await db.collection("games").findOne({
+      gameId: data.gameId
+    });
+
+    if (!game) return res.send("ok");
+
+    const user = await db.collection("users").findOne({
+      _id: new ObjectId(game.owner)
+    });
+
+    if (!user || !user.alertPrefs?.enabled) return res.send("ok");
+
+    const threshold = user.alertPrefs.minFps;
+    const cooldown = user.alertPrefs.cooldown * 1000;
+
+    if (data.fps && data.fps < threshold) {
+      const key = `${user._id}-${data.serverId}`;
+      const now = Date.now();
+
+      if (!lastAlertSent[key] || now - lastAlertSent[key] > cooldown) {
+        lastAlertSent[key] = now;
+
+        const msg = `[${data.serverId}] FPS ${data.fps}`;
+
+        await db.collection("alerts").insertOne({
+          gameId: data.gameId,
+          message: msg,
+          time: new Date()
+        });
+
+        await sendEmail(user.email, msg);
+
+        broadcast("alert", { message: msg });
+      }
+    }
+
+    res.send("ok");
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("error");
+  }
+});
+
+// ================= LIVE =================
+app.get("/live/:gameId", (req, res) => {
+  res.json(
+    Object.values(servers).filter(
+      s => s.gameId === req.params.gameId
+    )
+  );
+});
+
+// ================= ALERTS =================
+app.get("/alerts/:gameId", async (req, res) => {
+  const data = await db.collection("alerts")
+    .find({ gameId: req.params.gameId })
+    .sort({ time: -1 })
+    .limit(50)
+    .toArray();
+
+  res.json(data);
+});
+
+// ================= METRICS =================
+app.get("/metrics/:gameId", async (req, res) => {
+  const data = await db.collection("metrics")
+    .find({ gameId: req.params.gameId })
+    .sort({ time: -1 })
+    .limit(100)
+    .toArray();
+
+  res.json(data);
+});
+
+// ================= ROOT CAUSE =================
+app.get("/root/:id", async (req, res) => {
+  const data = await db.collection("metrics")
+    .find({ serverId: req.params.id })
+    .sort({ time: 1 })
+    .toArray();
+
+  let out = [];
+
+  for (let i = 1; i < data.length; i++) {
+    if (data[i].fps < data[i - 1].fps - 10) {
+      out.push("FPS drop detected");
+    }
+  }
+
+  res.json(out);
+});
+
+// ================= CLEANUP =================
+setInterval(() => {
+  const now = Date.now();
+
+  for (let id in servers) {
+    if (now - servers[id].lastUpdate > 30000) {
+      delete servers[id];
+    }
+  }
+}, 10000);
+
+// ================= ROOT =================
+app.get("/", (req, res) => {
+  res.send("API running 🚀");
+});
+
+// ================= START =================
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log("🚀 Server running on port " + PORT);
+});  );
   res.send("saved");
 });
 
