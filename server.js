@@ -1,105 +1,178 @@
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
-const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const { Resend } = require("resend");
+const http = require("http");
+const WebSocket = require("ws");
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-// ========================
 app.use(cors());
 app.use(express.json());
 app.use(rateLimit({ windowMs: 10000, max: 100 }));
 
-// ========================
-const SECRET = process.env.JWT_SECRET || "supersecret";
+const SECRET = process.env.JWT_SECRET || "secret";
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// ========================
-// DB
-// ========================
 const client = new MongoClient(process.env.MONGO_URI);
 let db;
 
-async function connectDB() {
-  await client.connect();
+client.connect().then(() => {
   db = client.db("rolag");
   console.log("✅ DB connected");
-}
-connectDB();
+});
 
-// ========================
-// MEMORY
-// ========================
 let servers = {};
-let lastAlertTime = {};
+let lastAlertSent = {};
+let clients = [];
 
-// ========================
-// EMAIL
-// ========================
-async function sendEmail(to, msg) {
-  try {
-    await resend.emails.send({
-      from: "alerts@yourdomain.com",
-      to,
-      subject: "🚨 Rolag Alert",
-      html: `<strong>${msg}</strong>`
-    });
-  } catch (err) {
-    console.error("Email error:", err);
-  }
+// ================= WEBSOCKET =================
+wss.on("connection", ws => {
+  clients.push(ws);
+  ws.on("close", () => {
+    clients = clients.filter(c => c !== ws);
+  });
+});
+
+function broadcast(type, data) {
+  clients.forEach(ws => {
+    ws.send(JSON.stringify({ type, data }));
+  });
 }
 
-// ========================
-// AUTH
-// ========================
+// ================= AUTH =================
 function auth(req, res, next) {
   const token = req.headers.authorization;
-  if (!token) return res.sendStatus(401);
+  if (!token) return res.status(401).send("No token");
 
   try {
     req.user = jwt.verify(token, SECRET);
     next();
   } catch {
-    res.sendStatus(401);
+    res.status(401).send("Invalid token");
   }
 }
 
-// ========================
-// 👤 REGISTER
-// ========================
+// ================= REGISTER =================
 app.post("/register", async (req, res) => {
-  try {
-    const { email, password } = req.body;
+  const { email, password } = req.body;
 
-    const exists = await db.collection("users").findOne({ email });
-    if (exists) return res.status(400).send("User exists");
+  const hash = await bcrypt.hash(password, 10);
 
-    const hash = await bcrypt.hash(password, 10);
+  await db.collection("users").insertOne({
+    email,
+    password: hash,
+    alertPrefs: { enabled: true, minFps: 30, cooldown: 300 }
+  });
 
-    await db.collection("users").insertOne({
-      email,
-      password: hash,
-      alertSettings: {
-        enabled: true,
-        fpsThreshold: 30
-      },
-      createdAt: new Date()
-    });
-
-    res.send("registered");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("error");
-  }
+  res.send("ok");
 });
 
-// ========================
-// 🔑 LOGIN
-// ========================
+// ================= LOGIN =================
 app.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  const u = await db.collection("users").findOne({ email });
+  if (!u) return res.status(400).send("no user");
+
+  const ok = await bcrypt.compare(password, u.password);
+  if (!ok) return res.status(400).send("wrong");
+
+  const token = jwt.sign({ id: u._id }, SECRET, { expiresIn: "7d" });
+  res.json({ token });
+});
+
+// ================= PREFS =================
+app.get("/me/prefs", auth, async (req, res) => {
+  const u = await db.collection("users").findOne({
+    _id: new ObjectId(req.user.id)
+  });
+  res.json(u.alertPrefs);
+});
+
+app.post("/me/prefs", auth, async (req, res) => {
+  await db.collection("users").updateOne(
+    { _id: new ObjectId(req.user.id) },
+    { $set: { alertPrefs: req.body } }
+  );
+  res.send("saved");
+});
+
+// ================= GAME =================
+app.post("/register-game", auth, async (req, res) => {
+  const { gameId, name } = req.body;
+
+  await db.collection("games").updateOne(
+    { gameId },
+    { $set: { name, owner: req.user.id } },
+    { upsert: true }
+  );
+
+  res.send("ok");
+});
+
+// ================= DATA =================
+app.post("/data", async (req, res) => {
+  const d = { ...req.body, time: new Date() };
+  await db.collection("metrics").insertOne(d);
+
+  servers[d.serverId] = { ...d, last: Date.now() };
+
+  broadcast("metrics", d);
+
+  const game = await db.collection("games").findOne({ gameId: d.gameId });
+  if (!game) return res.send("ok");
+
+  const user = await db.collection("users").findOne({
+    _id: new ObjectId(game.owner)
+  });
+
+  if (!user || !user.alertPrefs?.enabled) return res.send("ok");
+
+  const minFps = user.alertPrefs.minFps;
+  const cooldown = user.alertPrefs.cooldown * 1000;
+
+  if (d.fps < minFps) {
+    const key = `${user._id}-${d.serverId}`;
+    const now = Date.now();
+
+    if (!lastAlertSent[key] || now - lastAlertSent[key] > cooldown) {
+      lastAlertSent[key] = now;
+
+      await db.collection("alerts").insertOne({
+        gameId: d.gameId,
+        message: `Low FPS ${d.fps}`,
+        time: new Date()
+      });
+
+      await resend.emails.send({
+        from: "onboarding@resend.dev",
+        to: user.email,
+        subject: "🚨 FPS Alert",
+        html: `<p>Server ${d.serverId} FPS ${d.fps}</p>`
+      });
+
+      broadcast("alert", { message: `⚠️ FPS ${d.fps}` });
+    }
+  }
+
+  res.send("ok");
+});
+
+// ================= LIVE =================
+app.get("/live/:gameId", (req, res) => {
+  res.json(Object.values(servers));
+});
+
+// ================= START =================
+server.listen(process.env.PORT || 3000, () => {
+  console.log("🚀 Server running");
+});app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
