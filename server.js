@@ -1,3 +1,11 @@
+console.log("=== SERVER STARTING ===");
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
+});
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
@@ -20,6 +28,7 @@ const SECRET = process.env.JWT_SECRET || "secret";
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ================= DB =================
+console.log("Connecting to MongoDB...");
 const client = new MongoClient(process.env.MONGO_URI);
 let db;
 
