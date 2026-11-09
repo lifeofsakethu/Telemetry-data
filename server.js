@@ -27,6 +27,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 if (!MONGO_URI) console.warn("MONGO_URI is not configured; database-backed routes will remain unavailable.");
 
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 const mongo = MONGO_URI ? new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 10000 }) : null;
