@@ -1,6 +1,6 @@
 # RoLag
 
-RoLag is a Roblox server telemetry and performance observability platform. The repository contains the Render API and the static dashboard deployed to Netlify.
+RoLag is a Roblox server telemetry and performance observability platform. The repository contains the Render API, the static dashboard deployed to Netlify, and paste-ready Roblox server scripts.
 
 ## Local development
 
@@ -12,7 +12,7 @@ TELEMETRY_SECRET="a-separate-telemetry-secret" \
 node server.js
 ```
 
-The API serves the dashboard from `public/` and listens on `PORT` (default `10000`).
+The API listens on `PORT` (default `10000`). The static dashboard is available under `/dashboard` when the backend is serving the repository directly. Production frontend hosting is handled by Netlify.
 
 ## Render environment
 
@@ -32,11 +32,18 @@ Set these values in the Render service environment, never in source control:
 
 Existing routes remain available: `/`, `/register`, `/login`, `/me/prefs`, `/register-game`, `/data`, `/session`, `/live/:gameId`, `/alerts/:gameId`, `/metrics/:gameId`, `/timeline/:serverId`, and `/root/:serverId`.
 
-The upgrade adds authenticated game management, `/me`, `/games`, `/me/export`, `/me/import`, admin statistics and controls under `/admin/*`, health checks, per-user alert preferences, ownership checks, secure WebSocket subscriptions, telemetry authentication, MongoDB indexes, maintenance mode, and controlled NSYS modules.
+The platform also provides authenticated game management, `/me`, `/games`, `/me/export`, `/me/import`, admin statistics and controls under `/admin/*`, health checks, per-user alert preferences, ownership checks, secure WebSocket subscriptions, telemetry authentication, MongoDB indexes, maintenance mode, controlled NSYS modules, and the superadmin-only `/telemetry/status` diagnostics endpoint.
 
-## Roblox telemetry
+## Roblox integration
 
-Use server-side Scripts only. Set the same `TELEMETRY_SECRET` in the HTTP header sent by the scripts. The telemetry FPS is a server-side estimate and must not be presented as player client FPS.
+The paste-ready scripts are in [`roblox/`](roblox/):
+
+- `RoLagConfig.lua` — server-only configuration and secret.
+- `RoLagTelemetry.server.lua` — server FPS, players, memory, uptime, and reliable metric delivery.
+- `RoLagPlayerSessions.server.lua` — join/leave events with retries and shutdown flushing.
+- `roblox/README.md` — exact Roblox Studio placement and troubleshooting instructions.
+
+Use server-side Scripts only. Keep `RoLagConfig` in `ServerScriptService`, never `ReplicatedStorage`, because the telemetry secret must not replicate to clients. Set the same secret in Render and `RoLagConfig`. The telemetry FPS is a server-side estimate and must not be presented as player client FPS.
 
 ## Deployment
 

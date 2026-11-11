@@ -38,6 +38,7 @@ let maintenance = { enabled: false, message: "" };
 const liveServers = new Map();
 const sockets = new Set();
 const lastAlerts = new Map();
+const telemetryStats = { accepted: 0, rejected: 0, lastAcceptedAt: null };
 const loadedModules = [];
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "https://rolag.netlify.app,http://localhost:5173")
@@ -49,7 +50,8 @@ app.use(cors({ origin: (origin, callback) => {
 app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: false, limit: "32kb" }));
 app.use(rateLimit({ windowMs: 60 * 1000, limit: 180, standardHeaders: true, legacyHeaders: false }));
-app.use(express.static(path.join(__dirname, "public")));
+// The frontend is deployed separately to Netlify. Keep GET / as the API status route.
+
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const jsonError = (res, status, error, details) => res.status(status).json({ error, ...(details ? { details } : {}) });
@@ -89,6 +91,7 @@ function telemetryAuth(req, res, next) {
   const providedBuffer = Buffer.from(String(supplied || ""));
   const expectedBuffer = Buffer.from(String(TELEMETRY_SECRET));
   if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
+    telemetryStats.rejected += 1;
     return jsonError(res, 401, "Telemetry authentication failed");
   }
   next();
@@ -148,7 +151,7 @@ function maintenanceGuard(req, res, next) {
 }
 app.use(maintenanceGuard);
 
-app.get("/", (req, res) => res.json({ service: "RoLag API", status: "online", version: "2.0.0", database: Boolean(db), maintenance: maintenance.enabled }));
+app.get("/", (req, res) => res.json({ service: "RoLag API", status: "online", version: "2.1.0", database: Boolean(db), maintenance: maintenance.enabled }));
 app.get("/health", (req, res) => res.status(db ? 200 : 503).json({ status: db ? "ok" : "degraded", database: Boolean(db), uptime: process.uptime(), timestamp: now().toISOString() }));
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, message: { error: "Too many authentication attempts" } });
@@ -206,7 +209,10 @@ app.post("/data", telemetryAuth, requireDb, asyncRoute(async (req, res) => {
   const error = validateTelemetry(req.body); if (error) return jsonError(res, 400, error);
   const metric = { gameId: String(req.body.gameId), placeId: req.body.placeId ? String(req.body.placeId) : null, serverId: String(req.body.serverId), fps: Number(req.body.fps), players: Number(req.body.players), memoryMb: Number.isFinite(Number(req.body.memoryMb)) ? Number(req.body.memoryMb) : null, uptime: Number.isFinite(Number(req.body.uptime)) ? Number(req.body.uptime) : null, serverTimestamp: req.body.timestamp || null, time: now() };
   const game = await db.collection("games").findOne({ gameId: metric.gameId }); if (!game) return jsonError(res, 404, "Game is not registered");
-  await db.collection("metrics").insertOne(metric); liveServers.set(`${metric.gameId}:${metric.serverId}`, { ...metric, lastUpdate: Date.now(), owner: game.owner });
+  await db.collection("metrics").insertOne(metric);
+  telemetryStats.accepted += 1;
+  telemetryStats.lastAcceptedAt = now().toISOString();
+  liveServers.set(`${metric.gameId}:${metric.serverId}`, { ...metric, lastUpdate: Date.now(), owner: game.owner });
   broadcast("metric", metric, socket => socket.userId === game.owner && (!socket.gameId || socket.gameId === metric.gameId));
   const owner = await db.collection("users").findOne({ _id: new ObjectId(game.owner) }); const prefs = owner?.alertPrefs || {};
   if (owner && prefs.enabled && prefs.dashboardEnabled !== false && metric.fps < Number(prefs.minFps || 30)) {
@@ -227,6 +233,11 @@ app.get("/metrics/:gameId", auth, requireDb, asyncRoute(async (req, res) => { if
 app.get("/timeline/:serverId", auth, requireDb, asyncRoute(async (req, res) => { const game = await db.collection("games").findOne({ owner: String(req.user._id), gameId: req.query.gameId }); const query = game ? { serverId: req.params.serverId, gameId: game.gameId } : { serverId: req.params.serverId }; res.json(await db.collection("metrics").find(query).sort({ time: 1 }).limit(MAX_HISTORY).toArray()); }));
 app.get("/root/:serverId", auth, requireDb, asyncRoute(async (req, res) => { const gameIds = await db.collection("games").distinct("gameId", { owner: String(req.user._id) }); const metrics = await db.collection("metrics").find({ serverId: req.params.serverId, gameId: { $in: gameIds } }).sort({ time: 1 }).limit(MAX_HISTORY).toArray(); const findings = []; for (let i = 1; i < metrics.length; i++) if (Number(metrics[i].fps) < Number(metrics[i - 1].fps) - 10) findings.push({ type: "fps_drop", severity: "warning", from: metrics[i - 1].fps, to: metrics[i].fps, time: metrics[i].time }); res.json(findings); }));
 
+app.get("/telemetry/status", auth, superadmin, requireDb, asyncRoute(async (req, res) => {
+  const registeredGames = await db.collection("games").countDocuments();
+  res.json({ configured: Boolean(TELEMETRY_SECRET), registeredGames, activeServers: [...liveServers.values()].filter(s => Date.now() - s.lastUpdate < LIVE_TTL_MS).length, ...telemetryStats });
+}));
+
 app.get("/admin/stats", auth, superadmin, requireDb, asyncRoute(async (req, res) => { const [users, games, metrics, alerts] = await Promise.all([db.collection("users").countDocuments(), db.collection("games").countDocuments(), db.collection("metrics").countDocuments(), db.collection("alerts").countDocuments()]); res.json({ users, games, metrics, alerts, activeServers: [...liveServers.values()].filter(s => Date.now() - s.lastUpdate < LIVE_TTL_MS).length, uptime: process.uptime(), database: true, maintenance }); }));
 app.get("/admin/users", auth, superadmin, requireDb, asyncRoute(async (req, res) => { const search = String(req.query.search || "").trim(); const query = search ? { email: { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } } : {}; const users = await db.collection("users").find(query, { projection: { password: 0 } }).sort({ createdAt: -1 }).limit(100).toArray(); const withCounts = await Promise.all(users.map(async user => ({ ...safeUser(user), games: await db.collection("games").countDocuments({ owner: String(user._id) }) }))); res.json(withCounts); }));
 app.get("/admin/logs", auth, superadmin, requireDb, asyncRoute(async (req, res) => res.json(await db.collection("adminLogs").find().sort({ timestamp: -1 }).limit(200).toArray())));
@@ -237,6 +248,7 @@ async function setMaintenance(req, res, enabled) { maintenance = { enabled, mess
 app.post("/admin/maintenance/on", auth, superadmin, requireDb, (req, res) => setMaintenance(req, res, true));
 app.post("/admin/maintenance/off", auth, superadmin, requireDb, (req, res) => setMaintenance(req, res, false));
 
+app.use("/dashboard", express.static(path.join(__dirname, "public")));
 app.use((req, res) => jsonError(res, 404, "Route not found"));
 app.use((error, req, res, next) => { console.error("Request error:", error); if (res.headersSent) return next(error); jsonError(res, 500, "Internal server error"); });
 
